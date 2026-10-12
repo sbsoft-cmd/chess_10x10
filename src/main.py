@@ -1257,7 +1257,7 @@ def main():
     global DRAW_ICON, RESIGN_ICON, BACK_ICON, FLIP_ICON, FREESTYLE_ICON, BOARD_FLIPPED
 
     screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-    pygame.display.set_caption("Командные шахматы 10x10")
+    pygame.display.set_caption("Шахматы 10x10")
     font = pygame.font.SysFont("Arial", max(14, CELL // 5))
     big_font = pygame.font.SysFont("Arial", max(24, CELL // 2), bold=True)
     promo_font = pygame.font.SysFont("Arial", max(16, CELL // 4), bold=True)
