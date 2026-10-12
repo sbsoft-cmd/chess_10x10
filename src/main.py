@@ -12,8 +12,7 @@ LEFT_PANEL = 220
 RIGHT_PANEL = 120
 MARGIN = 20
 TOP_MARGIN = 20
-BOTTOM_MARGIN = 30      # ← новый отступ под буквы снизу
-
+BOTTOM_MARGIN = 30
 
 available_w = info.current_w - LEFT_PANEL - RIGHT_PANEL - 2 * MARGIN - 40
 available_h = info.current_h - TOP_MARGIN - MARGIN - BOTTOM_MARGIN - 40
@@ -22,7 +21,6 @@ CELL = min(available_w, available_h) // BOARD_SIZE
 
 WINDOW_W = LEFT_PANEL + BOARD_SIZE * CELL + RIGHT_PANEL + 2 * MARGIN
 WINDOW_H = TOP_MARGIN + BOARD_SIZE * CELL + MARGIN + BOTTOM_MARGIN
-
 
 PIECE_SIZE = CELL - 8
 INNER_SIZE = PIECE_SIZE - 6
@@ -42,6 +40,7 @@ CHECK_COLOR = (255, 0, 0)
 WIN_COLOR = (255, 215, 0)
 RESIGN_COLOR = (255, 120, 120)
 DROP_DOT = (80, 140, 255)
+QUEUE_COLOR = (255, 220, 100)
 
 OUTLINE_COLORS = {'w': (0, 0, 0), 'b': (255, 255, 255)}
 PLAYER_COLORS = {'w': (200, 220, 255), 'b': (255, 150, 150)}
@@ -50,7 +49,11 @@ TURN_ORDER = ['w', 'b']
 PROMOTION_CHOICES = ['Q', 'R', 'B', 'N', 'N2', 'R2', 'J']
 PAWN_FORWARD = {'w': (0, +1), 'b': (0, -1)}
 PAWN_PROMOTION_LINE = {'w': 9, 'b': 0}
+PAWN_START_ROW = {'w': 1, 'b': BOARD_SIZE - 2}  # ряд 1 для белых, ряд 8 для чёрных
 KING_BACK_ROW = {'w': 0, 'b': 9}
+
+# Реинкарнация: сколько своих ходов ждёт пешка.
+REINCARNATION_TURNS = 3
 
 DRAW_ICON = None
 RESIGN_ICON = None
@@ -60,6 +63,9 @@ FREESTYLE_ICON = None
 
 BOARD_FLIPPED = False
 DRAW_TIMEOUT = 10.0
+
+# Уменьшение пиктограмм запасных фигур (включая перетаскиваемую).
+RESERVE_ICON_SCALE = 0.7
 
 
 def is_enemy(c1, c2):
@@ -748,10 +754,38 @@ def apply_castle(position, c1, r1, c2, r2):
     position[(c2, r2)] = p1
 
 
+def has_own_pawn_on_file(position, color, file_c):
+    """Есть ли на вертикали file_c хотя бы одна пешка цвета color."""
+    for r in range(BOARD_SIZE):
+        if (file_c, r) in position:
+            pc, pt = position[(file_c, r)]
+            if pc == color and pt == 'P':
+                return True
+    return False
+
+
 def legal_drops(position, reserve, color, piece_type):
     if piece_type not in reserve[color]:
         return []
     result = []
+
+    if piece_type == 'P':
+        # Пешка — только на начальный ряд, только если на вертикали
+        # нет других своих пешек, и после постановки король не под шахом.
+        start_row = PAWN_START_ROW[color]
+        for c in range(BOARD_SIZE):
+            sq = (c, start_row)
+            if sq in position:
+                continue
+            if has_own_pawn_on_file(position, color, c):
+                continue
+            test = dict(position)
+            test[sq] = (color, 'P')
+            if not has_any_king_attacked(test, color):
+                result.append(sq)
+        return result
+
+    # Обычная логика для R2/J.
     for c in range(BOARD_SIZE):
         for r in range(BOARD_SIZE):
             if (c, r) in position:
@@ -789,16 +823,51 @@ def is_checkmate(position, color, moved_pawns, en_passant_moves, reserve):
     return not has_any_legal_move(position, color, moved_pawns, en_passant_moves, reserve)
 
 
+# --- Реинкарнация пешек ---
+
+def register_pawn_capture(reincarnating, color):
+    """Регистрирует срубленную пешку в очереди реинкарнации."""
+    reincarnating[color].append({'turns_left': REINCARNATION_TURNS, 'ready': False})
+
+
+def tick_reincarnation(reincarnating, color, reserve):
+    """Уменьшает счётчики реинкарнации для указанного цвета.
+       Вызывать после хода ЭТОГО цвета, до смены current_player."""
+    queue = reincarnating[color]
+    for entry in queue:
+        if entry['turns_left'] > 0:
+            entry['turns_left'] -= 1
+        if entry['turns_left'] == 0:
+            entry['ready'] = True
+    # Если в запасе нет пешки — берём первую готовую.
+    if 'P' not in reserve[color]:
+        for i, entry in enumerate(queue):
+            if entry['ready']:
+                reserve[color].append('P')
+                queue.pop(i)
+                break
+
+
+def promote_from_queue(reincarnating, color, reserve):
+    """Если в запасе нет пешки — берём первую готовую из очереди.
+       Вызывать после того, как место в запасе освободилось."""
+    if 'P' in reserve[color]:
+        return
+    queue = reincarnating[color]
+    for i, entry in enumerate(queue):
+        if entry['ready']:
+            reserve[color].append('P')
+            queue.pop(i)
+            return
+
+
 # --- Геометрия ---
 BOARD_ORIGIN_X = LEFT_PANEL + MARGIN
 BOARD_ORIGIN_Y = TOP_MARGIN
 
 RESERVE_CX = LEFT_PANEL + BOARD_SIZE * CELL + MARGIN + RIGHT_PANEL // 2
-# Размер ячейки запаса пропорционален клетке доски.
-# Немного меньше клетки доски, чтобы 2 ячейки с отступом помещались на половине высоты.
 RESERVE_SIZE = int(CELL * 0.72)
 RESERVE_GAP = max(6, CELL // 20)
-
 
 
 def cell_to_pixel(c, r):
@@ -821,13 +890,15 @@ def pixel_to_cell(mx, my):
 
 
 def reserve_slots():
+    """Слоты запаса: 3 типа (R2, J, P), сверху — чёрные, снизу — белые."""
     slots = []
-    types = ['R2', 'J']
+    types = ['R2', 'J', 'P']
     top_y = TOP_MARGIN + CELL // 2
     for i, t in enumerate(types):
         y = top_y + i * (RESERVE_SIZE + RESERVE_GAP)
         slots.append(('b', t, RESERVE_CX, y))
-    bottom_start = TOP_MARGIN + BOARD_SIZE * CELL - CELL // 2 - (len(types) - 1) * (RESERVE_SIZE + RESERVE_GAP)
+    bottom_start = (TOP_MARGIN + BOARD_SIZE * CELL - CELL // 2
+                    - (len(types) - 1) * (RESERVE_SIZE + RESERVE_GAP))
     for i, t in enumerate(types):
         y = bottom_start + i * (RESERVE_SIZE + RESERVE_GAP)
         slots.append(('w', t, RESERVE_CX, y))
@@ -936,8 +1007,7 @@ def draw_dragged_reserve(screen, pieces, dragging_reserve, drag_pos):
         return
     color, typ = dragging_reserve
     img = get_piece_image(pieces, color, typ)
-    # Уменьшаем до размера ячейки запаса
-    target = RESERVE_SIZE - 6
+    target = int((RESERVE_SIZE - 6) * RESERVE_ICON_SCALE)
     w, h = img.get_size()
     scale = min(target / w, target / h)
     if scale < 1.0:
@@ -947,7 +1017,8 @@ def draw_dragged_reserve(screen, pieces, dragging_reserve, drag_pos):
     screen.blit(img, rect)
 
 
-def draw_reserve(screen, pieces, reserve, selected_reserve, current_player, game_over):
+def draw_reserve(screen, pieces, reserve, selected_reserve,
+                 current_player, game_over, reincarnating, font):
     panel_x = LEFT_PANEL + BOARD_SIZE * CELL + MARGIN
     panel_y = TOP_MARGIN
     panel_w = RIGHT_PANEL
@@ -968,13 +1039,23 @@ def draw_reserve(screen, pieces, reserve, selected_reserve, current_player, game
                 border = (80, 140, 255)
         pygame.draw.rect(screen, border,
                          (cx - half, cy - half, RESERVE_SIZE, RESERVE_SIZE), 3)
+
+        # Для пешки рисуем цифру очереди рядом со слотом,
+        # независимо от того, лежит ли она в запасе.
+        if typ == 'P':
+            q = len(reincarnating[color])
+            if q > 0:
+                qtext = font.render(str(q), True, QUEUE_COLOR)
+                qr = qtext.get_rect()
+                qr.topright = (cx + half - 2, cy - half + 2)
+                screen.blit(qtext, qr)
+
         if not in_reserve:
             continue
         dim = (current_player != color) or game_over
         img = get_piece_image(pieces, color, typ)
 
-        # --- Уменьшаем картинку под размер ячейки с небольшим запасом ---
-        target = RESERVE_SIZE - 6
+        target = int((RESERVE_SIZE - 6) * RESERVE_ICON_SCALE)
         w, h = img.get_size()
         scale = min(target / w, target / h)
         if scale < 1.0:
@@ -1147,9 +1228,7 @@ def draw_buttons(screen, buttons, current_player, game_over, history,
     )
 
 
-# --- Тултипы ---
 def button_at(mx, my, buttons):
-    """Возвращает имя кнопки, если мышь внутри круга."""
     for name, (cx, cy, radius) in buttons.items():
         if math.hypot(mx - cx, my - cy) <= radius:
             return name
@@ -1157,7 +1236,6 @@ def button_at(mx, my, buttons):
 
 
 def button_at_with_margin(mx, my, buttons, margin=15):
-    """Возвращает имя кнопки, если мышь внутри круга + margin (гистерезис)."""
     for name, (cx, cy, radius) in buttons.items():
         if math.hypot(mx - cx, my - cy) <= radius + margin:
             return name
@@ -1167,59 +1245,42 @@ def button_at_with_margin(mx, my, buttons, margin=15):
 def update_cursor(position, reserve, buttons, hovered_button,
                   dragging, drag_moves, dragging_reserve, reserve_drag_pos,
                   current_player, game_over, mx, my):
-    """Устанавливает форму курсора в зависимости от контекста."""
-    # 1. Над кнопкой — рука.
     if hovered_button is not None:
         pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
         return
-
-    # 2. Тащим фигуру с доски — рука.
     if dragging is not None:
         pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
         return
-
-    # 3. Тащим фигуру из запаса — рука.
     if dragging_reserve is not None:
         pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
         return
-
     if game_over:
         pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
         return
-
-    # 4. Над слотом запаса, где лежит доступная фигура — рука.
     slot = slot_at(mx, my, reserve_slots())
     if slot is not None:
         color, typ, cx, cy = slot
         if current_player == color and typ in reserve[color]:
             pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
             return
-
-    # 5. Над клеткой, куда можно пойти — рука.
     c, r = pixel_to_cell(mx, my)
     if in_bounds(c, r):
         if (c, r) in drag_moves:
             pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
             return
-        # Над своей фигурой, чей сейчас ход — рука.
         if (c, r) in position:
             pc_color, pc_type = position[(c, r)]
             if pc_color == current_player:
                 pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
                 return
-
-    # Всё остальное — стрелка.
     pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
 
 
-
 def draw_tooltip(screen, font, buttons, hovered_button, hovered_time, now):
-    """Рисует тултип рядом с наведённой кнопкой, если прошло >= 700 мс."""
     if hovered_button is None:
         return
     if now - hovered_time < 700:
         return
-
     labels = {
         'freestyle': 'Случайная расстановка',
         'back': 'Назад',
@@ -1230,15 +1291,12 @@ def draw_tooltip(screen, font, buttons, hovered_button, hovered_time, now):
     label = labels.get(hovered_button)
     if label is None:
         return
-
     cx, cy, radius = buttons[hovered_button]
     text_surf = font.render(label, True, (255, 255, 255))
     tw, th = text_surf.get_size()
     pad = 8
     bg_w = tw + 2 * pad
     bg_h = th + 2 * pad
-
-    # Позиция справа от кнопки
     bg_x = cx + radius + 8
     bg_y = cy - bg_h // 2
     if bg_x + bg_w > WINDOW_W - 4:
@@ -1247,7 +1305,6 @@ def draw_tooltip(screen, font, buttons, hovered_button, hovered_time, now):
         bg_y = 4
     if bg_y + bg_h > WINDOW_H - 4:
         bg_y = WINDOW_H - 4 - bg_h
-
     pygame.draw.rect(screen, (20, 20, 30), (bg_x, bg_y, bg_w, bg_h))
     pygame.draw.rect(screen, (200, 200, 255), (bg_x, bg_y, bg_w, bg_h), 2)
     screen.blit(text_surf, (bg_x + pad, bg_y + pad))
@@ -1272,6 +1329,7 @@ def main():
 
     position = initial_position()
     reserve = {'w': ['R2', 'J'], 'b': ['R2', 'J']}
+    reincarnating = {'w': [], 'b': []}
     history = []
     moved_pawns = set()
     en_passant_move = None
@@ -1284,7 +1342,7 @@ def main():
     drag_double_moves = []
     drag_castle_moves = []
 
-    dragging_reserve = None  # (color, typ), если тащим из запаса
+    dragging_reserve = None
     reserve_drag_pos = None
 
     selected_reserve = None
@@ -1308,6 +1366,8 @@ def main():
         return {
             'position': dict(position),
             'reserve': {'w': list(reserve['w']), 'b': list(reserve['b'])},
+            'reincarnating': {'w': [dict(e) for e in reincarnating['w']],
+                              'b': [dict(e) for e in reincarnating['b']]},
             'moved_pawns': set(moved_pawns),
             'en_passant_move': en_passant_move,
             'en_passant_moves': dict(en_passant_moves),
@@ -1321,11 +1381,13 @@ def main():
         }
 
     def restore(snap):
-        nonlocal position, reserve, moved_pawns, en_passant_move, en_passant_moves
-        nonlocal vote_draw, draw_offer, winner, is_draw, resigned_by, current_player
-        nonlocal first_move_made
+        nonlocal position, reserve, reincarnating, moved_pawns, en_passant_move
+        nonlocal en_passant_moves, vote_draw, draw_offer, winner, is_draw
+        nonlocal resigned_by, current_player, first_move_made
         position = dict(snap['position'])
         reserve = {'w': list(snap['reserve']['w']), 'b': list(snap['reserve']['b'])}
+        reincarnating = {'w': [dict(e) for e in snap['reincarnating']['w']],
+                         'b': [dict(e) for e in snap['reincarnating']['b']]}
         moved_pawns = set(snap['moved_pawns'])
         en_passant_move = snap['en_passant_move']
         en_passant_moves = dict(snap['en_passant_moves'])
@@ -1342,22 +1404,17 @@ def main():
         now = pygame.time.get_ticks() / 1000.0
         game_over = (winner is not None) or is_draw or (resigned_by is not None)
 
-        # Таймаут ничьей
         if draw_offer is not None and now > draw_deadline:
             draw_offer = None
 
-        # Наведение на кнопки с гистерезисом (зона +15 пикселей)
         mx, my = pygame.mouse.get_pos()
         hb = button_at(mx, my, buttons)
         if hb is None and hovered_button is not None:
-            # Мышь чуть отошла — проверяем расширенную зону
             if button_at_with_margin(mx, my, buttons, margin=15) == hovered_button:
                 hb = hovered_button
         if hb != hovered_button:
             hovered_button = hb
             hovered_time = now
-
-
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -1371,10 +1428,13 @@ def main():
                             c, r, color = promotion_pending
                             position[(c, r)] = (color, typ)
                             promotion_pending = None
-                            current_player = 'b' if current_player == 'w' else 'w'
                             en_passant_move = None
                             en_passant_moves = {}
                             first_move_made = True
+                            # Ход сделан — сначала уменьшаем счётчики того,
+                            # кто ходил, потом меняем игрока.
+                            tick_reincarnation(reincarnating, color, reserve)
+                            current_player = 'b' if color == 'w' else 'w'
                             if is_checkmate(position, current_player,
                                             moved_pawns, en_passant_moves, reserve):
                                 winner = 'w' if current_player == 'b' else 'b'
@@ -1407,7 +1467,6 @@ def main():
                     continue
                 emx, emy = event.pos
 
-                # Кнопки
                 clicked = button_at(emx, emy, buttons)
                 if clicked == 'freestyle':
                     if not first_move_made and not game_over:
@@ -1452,7 +1511,6 @@ def main():
                 if game_over:
                     continue
 
-                # Нажатие на слот запаса — сразу начинаем drag
                 slot = slot_at(emx, emy, reserve_slots())
                 if slot is not None:
                     color, typ, cx, cy = slot
@@ -1463,7 +1521,6 @@ def main():
                         drop_moves = []
                     continue
 
-                # Клик по доске
                 c, r = pixel_to_cell(emx, emy)
                 if not in_bounds(c, r):
                     continue
@@ -1494,7 +1551,7 @@ def main():
                     continue
                 emx, emy = event.pos
 
-                # Отпускание drag из запаса
+                # --- Отпускание drag из запаса ---
                 if dragging_reserve is not None:
                     color, typ = dragging_reserve
                     c, r = pixel_to_cell(emx, emy)
@@ -1507,7 +1564,12 @@ def main():
                             en_passant_move = None
                             en_passant_moves = {}
                             first_move_made = True
-                            current_player = 'b' if current_player == 'w' else 'w'
+                            # Ход сделан: если поставили пешку — место в запасе
+                            # освободилось, сразу подтягиваем следующую готовую.
+                            if typ == 'P':
+                                promote_from_queue(reincarnating, color, reserve)
+                            tick_reincarnation(reincarnating, color, reserve)
+                            current_player = 'b' if color == 'w' else 'w'
                             if is_checkmate(position, current_player,
                                             moved_pawns, en_passant_moves, reserve):
                                 winner = 'w' if current_player == 'b' else 'b'
@@ -1515,12 +1577,14 @@ def main():
                     reserve_drag_pos = None
                     continue
 
-                # Отпускание drag с доски
+                # --- Отпускание drag с доски ---
                 if dragging is not None:
                     c, r = pixel_to_cell(emx, emy)
                     if in_bounds(c, r) and (c, r) in drag_moves:
                         history.append(snapshot())
                         is_castle = (c, r) in drag_castle_moves
+                        captured_piece = None
+
                         if is_castle:
                             apply_castle(position, dragging[0], dragging[1], c, r)
                             en_passant_move = None
@@ -1530,7 +1594,10 @@ def main():
                             enemy_pos = en_passant_moves.get((c, r))
                             if is_en_passant and enemy_pos is not None:
                                 if enemy_pos in position:
+                                    captured_piece = position[enemy_pos]
                                     del position[enemy_pos]
+                            if (c, r) in position:
+                                captured_piece = position[(c, r)]
                             moved_piece = position.pop(dragging)
                             position[(c, r)] = moved_piece
                             en_passant_move = None
@@ -1547,8 +1614,16 @@ def main():
                                         and is_promotion_square_for(current_player, c, r))
                             if is_promo:
                                 promotion_pending = (c, r, current_player)
+
+                        # Срубленную пешку — в очередь реинкарнации.
+                        if captured_piece is not None and captured_piece[1] == 'P':
+                            register_pawn_capture(reincarnating, captured_piece[0])
+
                         first_move_made = True
                         if promotion_pending is None:
+                            # Ход сделан — уменьшаем счётчики ходившего,
+                            # потом меняем игрока.
+                            tick_reincarnation(reincarnating, current_player, reserve)
                             current_player = 'b' if current_player == 'w' else 'w'
                             if is_checkmate(position, current_player,
                                             moved_pawns, en_passant_moves, reserve):
@@ -1559,7 +1634,7 @@ def main():
                     drag_double_moves = []
                     drag_castle_moves = []
 
-        # Отрисовка
+        # --- Отрисовка ---
         screen.fill((30, 30, 30))
         draw_board(screen, font)
         draw_checks(screen, position, current_player)
@@ -1571,7 +1646,7 @@ def main():
         draw_pieces(screen, position, pieces, dragging)
         draw_dragged_piece(screen, position, dragging, drag_pos, pieces)
         draw_reserve(screen, pieces, reserve, selected_reserve,
-                     current_player, game_over)
+                     current_player, game_over, reincarnating, font)
         draw_dragged_reserve(screen, pieces, dragging_reserve, reserve_drag_pos)
         draw_buttons(screen, buttons, current_player, game_over, history,
                      first_move_made, draw_offer)
@@ -1585,12 +1660,9 @@ def main():
         elif promotion_pending is not None:
             draw_promotion_window(screen, pieces, promotion_pending, promo_font)
 
-        # Тултип — поверх всего
         draw_tooltip(screen, tooltip_font, buttons,
                      hovered_button, hovered_time, now)
 
-
-        # Обновить курсор
         update_cursor(position, reserve, buttons, hovered_button,
                       dragging, drag_moves, dragging_reserve, reserve_drag_pos,
                       current_player, game_over, mx, my)
